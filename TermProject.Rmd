@@ -1,0 +1,377 @@
+---
+title: "Term Project - Technical Paper"
+author: "Turner Sale"
+date: "10/18/2019"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+The purpose of this time series analysis is to determine if there is an accurate model that can predict future demand for production orders at Company A (name obscured for data privacy). Company A competes in the conveyor and intralogistics marker globally and the United States branch provides productions for other branches and installers. As manufacturing is centralized in a single primary facility, the capacities thereof are limited and proper level loading and production planning is paramount. I am currently developing tools for such needs as well as simulations based on potential or incomplete orders, however, long term planning is not currently possible other than through experience and assumption.
+
+# Data 
+
+Data is collected from 07/01/2016 until 10/18/2019 (date of final analysis data dump) for all production orders (the final products are the outputs of such orders). Production orders contain a standard run time for each unit of measure, and are summed for each order. From this output the main dataset is gathered by grouping the production orders by date and work center, along with the sum of the aggregated run times. A simple count of production orders is also calculated for a potential second analysis, as count may assist in planning but run time is far more meaningful to the operations group.
+
+```{SQL eval = FALSE}
+SELECT pol2.[Ending Date]
+       ,pol2.[Work Center No_]
+       ,COUNT(pol2.[Prod_ Order No_]) AS 'Count of Prod_ Orders'
+       ,SUM(pol2.[Total Run Time]) AS 'Total Run Time'
+FROM (
+       SELECT pol.[Ending Date]
+              ,pol.[Prod_ Order No_]
+              ,pol.[Item Category Code]
+              ,pol.[Quantity]
+              ,porl.[Run Time] AS 'Run Time Per Production'
+              ,porl.[Run Time] * pol.[Quantity] AS 'Total Run Time'
+              ,porl.[Work Center No_]
+       FROM XXX AS pol
+              LEFT JOIN XXX AS porl
+                      ON pol.[Prod_ Order No_] = porl.[Prod_ Order No_]
+       WHERE pol.[Status] > 1
+              AND pol.[Item Category Code] = 'PRODUCT'
+              AND pol.[Ending Date] BETWEEN '07-01-2016' AND '10-18-2019'
+              AND porl.[Process Structure Code] = 'ASS' --Assembly work centers
+       ) AS pol2
+GROUP BY pol2.[Ending Date]
+       ,pol2.[Work Center No_]
+ORDER BY pol2.[Ending Date]
+       ,pol2.[Work Center No_]
+```
+
+The data is divided by work center as each area has a standard capacity design and a maximum capacity design, thus having an estimate for each work center could provide additional information for level loading, but the overall labor need (run time) is paramount.
+
+### Libraries
+
+```{r message = FALSE, results = 'hide'}
+library(dplyr)
+library(readxl)
+library(lubridate)
+library(fpp2)
+library(forecast)
+library(ggfortify)
+library(zoo)
+library(MuMIn)
+```
+
+
+### Import Data
+
+The output of the SQL ETL was saved as a .xlsx for ease of transport and inport into R. This .xlsx is then imported and the resultant schema can be seen.
+
+```{r}
+InitData <- readxl::read_xlsx(path = "ProdData.xlsx", .name_repair = "universal")
+head(InitData)
+```
+
+As can be seen, not all dates contain data, nor does each date contain all work centers. For the primary analysis, the data will be aggregated by date and then converted to a time series object with the :Total Run Time" as the dependent variable.
+
+### Aggregate Data
+
+```{r}
+AggData <- InitData %>% group_by(Ending.Date) %>% summarise(Total.Run.Time = sum(Total.Run.Time))
+head(AggData)
+```
+
+### Monthly Data
+
+As there are missing dates in this time series, it is then converted to a monthly grain to be used in modeling.
+
+```{r}
+MonthData <- AggData %>% group_by(Month = lubridate::floor_date(Ending.Date, "month")) %>% summarise(Total.Run.Time = sum(Total.Run.Time))
+
+head(MonthData)
+```
+
+Now that the grain has been adjusted, we can see that each month has a run time associated with it and can be converted to a time series object and plot it to see any potential trends.
+
+### Conversion to ts
+
+```{r}
+MonthTs <- as.ts(MonthData$Total.Run.Time, frequency = 12, start = '2016-07-01', end = '2019-10-18')
+head(MonthTs)
+```
+
+### Plot Time Series
+
+```{r}
+autoplot(MonthTs)
+```
+
+# Analysis
+
+### Preliminary 
+
+The first thing to determine is whether there are any seasonality effects or trends in the dateset. Looking at the plot of the month does not clearly show any seasonality trends, but it does show a trend upwars for the first 25 or so months, then a clear drop around month 30 before rebounding around month 39.
+
+As the final month (October of 2019) is incomplete, it will be removed from the time series first, then an ACF will be run to determine if the pattern is just white noise.
+
+```{r}
+MonthTs2 <- as.ts(head(as.zoo(MonthTs),-1), frequency = 12)
+ggAcf(MonthTs2)
+```
+
+First we do an ACF on the truncated data to see if it in fact white noise, which it is not. Here we can see that there are several lags which have values outside the bounds and are not randomly distributed.
+
+### Box-Cox Transformation
+
+To attempt to remove some of the variability in our model, a Box-Cox transformation will be applied using the automatic lambda selection method.
+
+```{r}
+MonthBox <- BoxCox(MonthTs2, lambda = "auto")
+autoplot(MonthBox)
+```
+
+After application of the transformation, it would be appear that it is not necessary for this dataset, thus we will use the raw, untransformed data moving forward.
+
+### Decomposition
+
+In order to more rigorously determine if the time series has significant seasonality or trend components, we will be using the ets() function to break the series into its relevant components. First though, we must determine if the time series is additive or multiplicative. From our plotting, it is clear that over time the variance increased as a whole, thus we will operate under the supposition that the series is multiplicative.
+
+Taking this knowledge, we then use the stl() function in conjunction with the plot of the decomposition, as well as include the output from the stl() function in order to see how each component effects every observation in the series.
+
+```{r error = TRUE}
+DecompMonth2 <- stl(MonthTs2, s.window = "periodic")
+autoplot(DecompMonth2)
+```
+
+Here we have an issue when attempting to remove seasonality trends, as R does not recognize the time series as periodic. This does seem to be an issue with the code, even though the data is specified as a monthly frequency. Perhaps it is due to the aggregation, but even using the original AggData does not resolve this issue, as it does not consider the series to be univariate.
+
+```{r error = TRUE}
+DecompAgg <- stl(AggData)
+autoplot(DecompAgg)
+```
+
+Casting this AggData to a ts also does not seem to help as it will not accept the starting and ending dates as one would expect.
+
+```{r error = TRUE}
+AggTs <- ts(AggData, start = '2016-07-01', end = '2019-10-18', frequency = 12)
+DecompAggTs <- stl(AggTs)
+autoplot(DecompAggTs)
+```
+
+### Stationary Analysis
+
+As decomposition proved unsuccessful, we will now move on to determine if the data set is stationary before moving to other models. Having looked at the plot and believing it to be stationary, it is now time to test this empirically.
+
+First a Ljung-Box test will be conducted on the monthly data.
+
+```{r}
+Box.test(MonthTs2, lag=10, type="Ljung-Box")
+```
+
+The p-value from this test is very small, thus suggesting that our data set is stationary, meaning is has no trend or seasonality. Because of this we need not use differencing to ensure our data is stationary.
+
+It is possible that lower grains of data are not stationary, to demonstrate the AggTs created above was also run through as Ljung-Box test, but R does not recognize the series as a univariate time series. Presumably, the series is not a proper univariate series due to missing dates in the original data set. If this were filled then perhaps it would process correctly.
+
+```{r error = TRUE}
+Box.test(AggTs, lag=10, type="Ljung-Box")
+```
+
+### Exponential Smoothing
+
+Now that we know the series is stationary, and we cannot decompose it, it is time to look at predicting future values based on models. The first model that will be used is the simple exponential smoothing model.
+
+```{r}
+SES1 <- ses(MonthTs2,h=10)
+round(accuracy(SES1),2)
+```
+
+Here we see a RMSE (Root Mean Square Error) of 544.83. It is difficult to tell how well this model fits, thus we will plot the fitted values against the real data.
+
+```{r}
+autoplot(SES1) +
+  autolayer(fitted(SES1), series = "Model")
+```
+
+Here we can see the smoothing of the data as well as the predictions. We can tell that there is quite a large amount of variability in the estimates as the prediction interval is very large. Perhaps we can reduce this interval or RMSE for a better model.
+
+### Holt's and Damped
+
+Next we will look at Holt's linear method in both damped and non-damped flavors.
+
+```{r}
+HoltNonDamp <- holt(MonthTs2, damped = FALSE)
+HoltDamped <- holt(MonthTs2, damped = TRUE)
+
+autoplot(MonthTs2) +
+  autolayer(HoltNonDamp, series = "Non-damped", PI = FALSE) +
+  autolayer(HoltDamped, series = "Damped", PI = FALSE) +
+  autolayer(SES1, series = "Simple", PI=FALSE)
+```
+
+This graph shows the upward trend charateristic of the damped method (which ensures a positive correlation). It would seem reasonable that the damped method would be more accurate given market conditions and recent trends, whereas the non-damped will be more influenced by the downturn in month 30-35.
+
+To test which method is more accurate, we will compare MSE and MAE as shown in our textbook.
+
+```{r}
+S <- tsCV(MonthTs2,ses, h=1)
+HN <- tsCV(MonthTs2, holt, h=1)
+HD <- tsCV(MonthTs2,holt, damped = TRUE, h=1)
+Smse <- mean(S^2, na.rm = TRUE)
+HNmse <- mean(HN^2, na.rm = TRUE)
+HDmse <- mean(HD^2, na.rm = TRUE)
+Smae <- mean(abs(S), na.rm = TRUE)
+HNmae <- mean(abs(HN), na.rm = TRUE)
+HDmae <- mean(abs(HD), na.rm = TRUE)
+#MSE
+Smse
+HNmse
+HDmse
+#MAE
+Smae
+HNmae
+HDmae
+```
+
+Here we can see that that SES method is actually the best performer in both metrics, thus we will look more closely at the model itself.
+
+```{r}
+SES1[["model"]]
+```
+
+Here we have a nice metric to use for comparison: the AIC (Akaikes Information Criterion) and AICc (small sample biased AIC correction). We will use the AIC as we only have 39 months (observations). Comparing the AICc of our SES1 model (640.3159) against our Holt's methods then is another good way to compare the models.
+
+```{r}
+HoltNonDamp[["model"]]
+HoltDamped[["model"]]
+```
+
+```{r echo = FALSE}
+comp <- data.frame("Model" = c("SES1","HoltNonDamp","HoltDamped"), "AICc" = c(640.3159,645.4926,646.8712))
+head(comp)
+```
+
+Again we can see that the SES model was the highest performer (lowest AICc).
+
+### The ETS() Function
+
+The next model to look at is that generated using the ets() function. This function is designed to minimize the AICc to select a model automatically. We will create a couple models to compare the AICc of each to see if we can beat the automatic functionality.
+```{r}
+ETSAuto <- ets(MonthTs2)
+ETSANN <- ets(MonthTs2, model = "ANN")
+ETSMNN <- ets(MonthTs2, model = "MNN")
+AICc(ETSAuto)
+AICc(ETSANN)
+AICc(ETSMNN)
+```
+
+Here we can see that the automatic model and the defined MNN model both had the same AICc. To determine if this is due to them selecting the same model, we can look more in depth at the ETSAuto.
+
+```{r}
+summary(ETSAuto)
+```
+
+Here we see that they did in fact select the same model. We will thus take this model and compare it's predictions to that of our best contender: SES1.
+
+```{r}
+autoplot(MonthTs2) +
+  autolayer(SES1, series = "SES1", PI=FALSE) +
+  autolayer(forecast(ETSAuto, h=10), series = "ETSAuto", PI=FALSE)
+```
+
+Additionally we can look at the components of the ETSAuto function for a simpel decomposition.
+
+```{r}
+autoplot(ETSAuto)
+```
+
+### ARIMA Models
+
+Now that we know our data is stationary, it is not affected by seasonality or trends, and we have two models of similar accuracy, it is time to look at the last set of models for this analysis.
+
+ARIMA models combine many of the previous models and offers many potential models for fitting. In order to determine our hyperparameters, we will have to dig a little deeper.
+
+First off is determining the level of differencing. This is very easy, as we know that it is one. If the data was not stationary then we would need to conduct some differencing, run a Ljung-Box test and try again until the data is stationary.
+
+Second is the determine the P and Q values of our ARIMA model. The P and Q can be estimated using the ACF and PACF plots.
+
+```{r}
+ggAcf(MonthTs2)
+```
+
+```{r}
+ggPacf(MonthTs2)
+```
+
+The ACF graph appears to be sinusoidal, suggesting that the Q may be 0, and the fact that there is a spike at 1 in the PACF graph lends itself to the conclusion that Q=1.
+
+Given this, we can then count the number of spikes in the PACF (as the textbook does much the same in their discussion in 8.5), which is just one. Thus, for our own model we will use a (0,0,1) model, along with the auto.arima() function to see what R finds. We will also disable stepwise and approximation in order to get more options from the automatic function.
+
+```{r}
+AutoA <- forecast::auto.arima(MonthTs2, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+AutoA
+```
+
+```{r}
+PersonalA <- Arima(MonthTs2, order = c(0,0,1))
+PersonalA
+```
+
+After running our automatic function and personally defined function, we can see that R happened to beat us out by differencing the data one time. Considering our Ljung-Box test suggested the data was static, it did not seem as though the model would be as accurate, however the AICc is the lowest of all our models.
+
+Considering both models were more accurate than our previous models, it may be of use to plot the forecasts alone and in conjunction will all the other models.
+
+```{r}
+autoplot(MonthTs2) +
+  autolayer(forecast(AutoA, h=10), series = "AutoArima", PI = FALSE) +
+  autolayer(forecast(PersonalA, h=10), series = "Personal Arima", PI = FALSE)
+```
+
+```{r}
+autoplot(MonthTs2) +
+  autolayer(SES1, series = "SES1", PI=FALSE) +
+  autolayer(forecast(ETSAuto, h=10), series = "ETSAuto", PI=FALSE) +
+  autolayer(HoltNonDamp, series = "Non-damped", PI = FALSE) +
+  autolayer(HoltDamped, series = "Damped", PI = FALSE) +
+  autolayer(forecast(AutoA, h=10), series = "AutoArima", PI = FALSE) +
+  autolayer(forecast(PersonalA, h=10), series = "Personal Arima", PI = FALSE)
+```
+
+
+# Conclusion
+
+After running all models, we have seen that the auto.arima() with removal of seasonality and being forced to disable stepwise and approximation had the best results in reducing the AICc. Given this, we can assume that the ARIMA(0,1,1) model is our most accurate estimator given our dataset. Perhaps including additional data could improve the estimation, or changing the grain to weekly or monthly may also be helpful. OUr forecasts for the next ten months then are as follows.
+
+```{r}
+AutoForecast <- forecast(AutoA, h=10)
+AutoForecast
+```
+
+Once October of 2019 (month 40) is completed, I will reevaluate this estimation and see how accurate it actually was.
+
+## Potential Changes
+
+
+### Splitting Work Centers
+
+Rather than combining all work centers into one, we could model each work center indipendently, however, given the reduced data volume and more sporadic observations, we can see below that the time ranges are smaller, and perhaps less likely to provide accurate forecasts. Additionally, the model cannot account for changes in production centers, for example, ASY-150-A, ASY-150-B, and ASY-150-C were actually removed and became ASY-ITR-130 and ASY-ITR-130A. If they were combined into one then we could handle this change, but since they can split and mix it is difficult to know where they were transitioned to without significant work in SQL during ETL.
+
+```{r message = FALSE, warning = FALSE}
+ggplot(InitData, mapping = aes(x = Ending.Date, y = Total.Run.Time)) +
+  geom_point() + 
+  facet_wrap(Work.Center.No_~.) + 
+  geom_smooth()
+```
+
+### Use Multiple Linear Regression Models
+
+Instead of using a time series and univariate analysis, perhaps including other factors (such as days in the month, work center, sales costs, holidays, etc.) may improve the model accuracy, but would require tools outside of this report. Such models could include Neural Networks, Decision Trees, and the like.
+
+## Future Work
+
+AS times goes by I will compare the model results to the reality and see how accurate each model was in predictions, and if any are able to consisitently predict at least the confidence interval.
+
+I also plan to do a similar analysis on sales data to determine if there is a good way to predict future costs, revenues, profits, margins, etc. Rarely does Company A use advanced time series to make decisions, and although the models may not be incredibly accurate, they are still far better than a hunch. 
+
+Additionally, including other market factors (such as GDP change, CPI change, trade war status (we purchase large volumes of steel, so import tarrifs play a role in our costing), and the like) is also on my list for both sales data and production data.
+
+It may also be possible to predict on time completion and delivery to customer in this method as well, using things like the completion rate of assembled goods as a predictor for delivery dates, but that will require more in depth analysis of the data sets and data model.
